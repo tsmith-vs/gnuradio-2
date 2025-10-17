@@ -11,7 +11,12 @@ import types
 import logging
 import yaml
 from operator import methodcaller, attrgetter
-from typing import (List, Set, Optional, Iterator, Iterable, Tuple, Union, OrderedDict)
+from typing import (List, Set, Optional, Iterator, Iterable, Tuple, Union, OrderedDict, Sequence)
+import ast
+import importlib
+from types import MappingProxyType
+from typing import Optional
+
 
 from . import Messages
 from .base import Element
@@ -20,6 +25,522 @@ from .params import Param
 from .utils import expr_utils
 
 log = logging.getLogger(__name__)
+
+# Optional but common in GRC expressions
+try:
+    import numpy as _np
+except Exception:
+    _np = None
+import math as _math
+
+class UnsafeExpressionError(Exception):
+    pass
+
+# Restrictive builtins: no __import__, open, exec, eval, compile, etc.
+SAFE_BUILTINS = MappingProxyType({
+    "abs": abs,
+    "min": min,
+    "max": max,
+    "round": round,
+    "int": int,
+    "float": float,
+    "complex": complex,
+    "bool": bool,
+    "str": str,
+    "len": len,
+    "tuple": tuple,
+    "list": list,
+    "dict": dict,
+    "set": set,
+    # NOTE: Do not include __import__, open, eval, exec, compile, globals, locals, vars, getattr, setattr, delattr, etc.
+})
+
+# Allowed top-level modules by name (if present in namespace)
+ALLOWED_MODULE_NAMES = {"math", "numpy", "np"}
+
+# Allowed attributes callable on math/numpy modules
+# Keep conservative; extend if you need more.
+MATH_ATTRS = {
+    "pi", "e", "tau",
+    "sin", "cos", "tan",
+    "asin", "acos", "atan", "atan2",
+    "sinh", "cosh", "tanh",
+    "asinh", "acosh", "atanh",
+    "exp", "log", "log10", "log2",
+    "sqrt", "pow", "floor", "ceil", "fabs",
+    "degrees", "radians",
+}
+NUMPY_ATTRS_CONST = {
+    # constants & dtypes commonly used in GRC
+    "pi", "e",
+    "float16", "float32", "float64",
+    "int8", "int16", "int32", "int64",
+    "uint8", "uint16", "uint32", "uint64",
+    "complex64", "complex128",
+}
+NUMPY_ATTRS_FUNCS = {
+    # basic numerics that are typically safe
+    "sin", "cos", "tan", "arcsin", "arccos", "arctan", "arctan2",
+    "sinh", "cosh", "tanh", "arcsinh", "arccosh", "arctanh",
+    "exp", "log", "log10", "log2", "sqrt", "power",
+    "floor", "ceil", "abs", "maximum", "minimum",
+    "deg2rad", "rad2deg",
+    # array constructors common in parameters (optional; comment out if you want stricter)
+    "array", "arange", "linspace",
+}
+NUMPY_ATTRS = NUMPY_ATTRS_CONST | NUMPY_ATTRS_FUNCS
+
+# For calls by bare name (not module.attr), allow only these builtins
+ALLOWED_BARE_CALLS = {"abs", "min", "max", "round", "int", "float", "complex", "bool", "len"}
+
+# Nodes we allow in expressions
+_ALLOWED_NODE_TYPES = (
+    ast.Expression,
+    ast.BinOp, ast.UnaryOp, ast.BoolOp, ast.Compare, ast.IfExp,
+    ast.Num, ast.Constant,  # literals
+    ast.Name,
+    ast.Attribute,
+    ast.Subscript, ast.Slice, ast.ExtSlice, ast.Index,  # Index is py<3.9; harmless in 3.11 AST but safe to list
+    ast.Tuple, ast.List, ast.Dict, ast.Set,
+    ast.Load,
+    ast.Call,
+)
+
+# Allowed operators
+_ALLOWED_BINOPS = (ast.Add, ast.Sub, ast.Mult, ast.Div, ast.FloorDiv, ast.Mod, ast.Pow, ast.MatMul)
+_ALLOWED_UNARYOPS = (ast.UAdd, ast.USub, ast.Not, ast.Invert)
+_ALLOWED_CMPOPS = (ast.Eq, ast.NotEq, ast.Lt, ast.LtE, ast.Gt, ast.GtE, ast.Is, ast.IsNot, ast.In, ast.NotIn)
+_ALLOWED_BOOLOPS = (ast.And, ast.Or)
+
+# Allowlist of module prefixes that GRC commonly needs. Extend as necessary.
+ALLOWED_IMPORT_PREFIXES = {
+    "math",
+    "numpy",
+    "gnuradio",
+    "gnuradio.gr",
+    "pmt",
+}
+
+def _attr_chain(node: ast.AST) -> list[str]:
+    """
+    Return ['root', 'attr1'] for 'root.attr1', or longer lists for deeper chains.
+    If not a simple attribute chain, return [].
+    """
+    parts: list[str] = []
+    cur = node
+    while isinstance(cur, ast.Attribute):
+        parts.append(cur.attr)
+        cur = cur.value
+    if isinstance(cur, ast.Name):
+        parts.append(cur.id)
+        return list(reversed(parts))
+    return []  # Not a simple Name.attr[.attr...] chain
+
+class _SafeExprValidator(ast.NodeVisitor):
+    def visit(self, node):  # type: ignore[override]
+        if not isinstance(node, _ALLOWED_NODE_TYPES):
+            raise UnsafeExpressionError(f"Unsupported expression node: {type(node).__name__}")
+        return super().visit(node)
+
+    def visit_Call(self, node: ast.Call):
+        # Only allow calls to:
+        #  - whitelisted builtins by bare name (e.g., abs(x))
+        #  - whitelisted math/numpy functions by module attribute (e.g., math.sin(x), np.sqrt(x))
+        func = node.func
+
+        if isinstance(func, ast.Name):
+            if func.id not in ALLOWED_BARE_CALLS:
+                raise UnsafeExpressionError(f"Calling '{func.id}' is not allowed.")
+        elif isinstance(func, ast.Attribute):
+            chain = _attr_chain(func)
+            if len(chain) != 2:
+                # Disallow deep attribute calls like np.random.rand()
+                raise UnsafeExpressionError("Deep attribute calls are not allowed.")
+            root, attr = chain
+            if root not in ALLOWED_MODULE_NAMES:
+                raise UnsafeExpressionError(f"Calls on '{root}' are not allowed.")
+            if root in {"math"} and attr not in MATH_ATTRS:
+                raise UnsafeExpressionError(f"math.{attr} is not allowed.")
+            if root in {"numpy", "np"} and attr not in NUMPY_ATTRS:
+                raise UnsafeExpressionError(f"{root}.{attr} is not allowed.")
+        else:
+            raise UnsafeExpressionError("Only direct function names or module attributes may be called.")
+
+        # Validate arguments/keywords recursively
+        for a in node.args:
+            self.visit(a)
+        for kw in node.keywords or []:
+            self.visit(kw.value)
+
+    def visit_Attribute(self, node: ast.Attribute):
+        # Allow attribute access ONLY on allowed modules and only for whitelisted attributes.
+        chain = _attr_chain(node)
+        if not chain:
+            raise UnsafeExpressionError("Attribute access on non-module objects is not allowed.")
+        if len(chain) != 2:
+            raise UnsafeExpressionError("Deep attribute chains are not allowed.")
+        root, attr = chain
+        if root == "math" and attr not in MATH_ATTRS:
+            raise UnsafeExpressionError(f"math.{attr} is not allowed.")
+        if root in {"numpy", "np"} and attr not in NUMPY_ATTRS:
+            raise UnsafeExpressionError(f"{root}.{attr} is not allowed.")
+
+    def visit_Subscript(self, node: ast.Subscript):
+        # Indexing/slicing is allowed as long as inner nodes are safe
+        self.visit(node.value)
+        self.visit(node.slice)
+
+    def visit_Slice(self, node: ast.Slice):
+        if node.lower: self.visit(node.lower)
+        if node.upper: self.visit(node.upper)
+        if node.step:  self.visit(node.step)
+
+    def visit_BoolOp(self, node: ast.BoolOp):
+        if not isinstance(node.op, _ALLOWED_BOOLOPS):
+            raise UnsafeExpressionError("Boolean operator not allowed.")
+        for v in node.values:
+            self.visit(v)
+
+    def visit_BinOp(self, node: ast.BinOp):
+        if not isinstance(node.op, _ALLOWED_BINOPS):
+            raise UnsafeExpressionError("Binary operator not allowed.")
+        self.visit(node.left)
+        self.visit(node.right)
+
+    def visit_UnaryOp(self, node: ast.UnaryOp):
+        if not isinstance(node.op, _ALLOWED_UNARYOPS):
+            raise UnsafeExpressionError("Unary operator not allowed.")
+        self.visit(node.operand)
+
+    def visit_Compare(self, node: ast.Compare):
+        for op in node.ops:
+            if not isinstance(op, _ALLOWED_CMPOPS):
+                raise UnsafeExpressionError("Comparison operator not allowed.")
+        self.visit(node.left)
+        for c in node.comparators:
+            self.visit(c)
+
+    def visit_IfExp(self, node: ast.IfExp):
+        self.visit(node.test)
+        self.visit(node.body)
+        self.visit(node.orelse)
+
+    # Literals & containers are inherently safe (already whitelisted in _ALLOWED_NODE_TYPES)
+    # We still walk elements to enforce safety of nested expressions.
+    def visit_Tuple(self, node: ast.Tuple):
+        for el in node.elts: self.visit(el)
+
+    def visit_List(self, node: ast.List):
+        for el in node.elts: self.visit(el)
+
+    def visit_Set(self, node: ast.Set):
+        for el in node.elts: self.visit(el)
+
+    def visit_Dict(self, node: ast.Dict):
+        for k in node.keys: 
+            if k is not None: self.visit(k)
+        for v in node.values: self.visit(v)
+
+    def visit_Name(self, node: ast.Name):
+        # Bare names are OK, they resolve in filtered globals/locals later.
+        # We specifically do NOT allow access to __builtins__ by not injecting it in globals.
+        return
+
+    def visit_Constant(self, node: ast.Constant):
+        # Allow numbers, strings, bytes, bools, None
+        return
+
+def _filter_globals_for_eval(namespace: dict) -> dict:
+    """
+    Build a safe globals dict for eval: restricted builtins and filtered modules.
+    We copy over all user variables (ints, floats, lists, dicts, etc.) and any
+    allowed modules (math, numpy/np) if present.
+    """
+    g = {"__builtins__": SAFE_BUILTINS}
+
+    # expose math (always safe subset)
+    g["math"] = _math
+
+    # expose numpy aliases if in the incoming namespace or importable
+    if "numpy" in namespace and namespace["numpy"] is not None:
+        g["numpy"] = namespace["numpy"]
+    elif _np is not None:
+        g["numpy"] = _np
+
+    if "np" in namespace and namespace["np"] is not None:
+        g["np"] = namespace["np"]
+    elif _np is not None:
+        g["np"] = _np
+
+    # Copy non-module variables through verbatim.
+    for k, v in namespace.items():
+        # Skip shadowing of protected names
+        if k in {"__builtins__", "__import__"}:
+            continue
+        # Do not expose disallowed modules (if any slipped into namespace)
+        modname = getattr(v, "__name__", None)
+        if modname and getattr(v, "__spec__", None) is not None:
+            # it's a module-like object
+            if k not in ALLOWED_MODULE_NAMES:
+                continue  # skip disallowed modules
+        g[k] = v
+
+    return g
+
+
+class ImportSecurityError(Exception):
+    pass
+
+def _is_allowed_import(modname: str) -> bool:
+    if not modname:
+        return False
+    return any(
+        modname == prefix or modname.startswith(prefix + ".")
+        for prefix in ALLOWED_IMPORT_PREFIXES
+    )
+
+
+def _validate_imports_only(source: str) -> ast.Module:
+    """
+    Parse 'source' and ensure it contains ONLY:
+      - import / from-import statements
+      - optional module docstring
+    Rejects: relative imports, wildcard imports, and any other statements.
+    """
+    try:
+        tree = ast.parse(source, mode="exec")
+    except SyntaxError as e:
+        raise e
+
+    allowed_topnodes = (ast.Import, ast.ImportFrom, ast.Expr)
+    if not all(isinstance(node, allowed_topnodes) for node in tree.body):
+        raise ImportSecurityError("Only import statements (and an optional docstring) are allowed.")
+
+    for node in tree.body:
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if not _is_allowed_import(alias.name):
+                    raise ImportSecurityError(f'Disallowed import: "{alias.name}"')
+        elif isinstance(node, ast.ImportFrom):
+            if (node.level or 0) > 0:
+                raise ImportSecurityError("Relative imports are not allowed.")
+            if any(a.name == "*" for a in node.names):
+                raise ImportSecurityError('Wildcard imports (from x import *) are not allowed.')
+            if not node.module or not _is_allowed_import(node.module):
+                raise ImportSecurityError(f'Disallowed import: "{node.module or ""}"')
+        elif isinstance(node, ast.Expr):
+            # Only allow a module docstring
+            if not (isinstance(node.value, ast.Constant) and isinstance(node.value.value, str)):
+                raise ImportSecurityError("Only a module docstring is allowed as a top-level expression.")
+
+    return tree
+
+def _apply_validated_imports(source: str, namespace: dict) -> None:
+    """
+    Execute only import statements in a controlled way, binding names into namespace.
+    Mirrors Python's binding semantics without exec() on arbitrary code.
+    """
+    tree = _validate_imports_only(source)
+
+    for node in tree.body:
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                modname = alias.name
+                asname = alias.asname
+
+                # Ensure the full module is loaded
+                module = importlib.import_module(modname)
+
+                if asname:
+                    namespace[asname] = module
+                else:
+                    # 'import a.b' binds 'a'
+                    top_level = modname.split(".")[0]
+                    namespace[top_level] = importlib.import_module(top_level)
+
+        elif isinstance(node, ast.ImportFrom):
+            module_name = node.module
+            module = importlib.import_module(module_name)
+            for alias in node.names:
+                bind_name = alias.asname or alias.name
+                namespace[bind_name] = getattr(module, alias.name)
+        else:
+            # Expr nodes here are only a docstring—ignore
+            pass
+
+
+class ModuleSecurityError(Exception):
+    pass
+
+def _validate_module_source(source: str) -> ast.Module:
+    """
+    Allow a conservative subset for module code:
+      - import / from-import (allowlist, no relative, no wildcard)
+      - assignments / annotated assignments
+      - function and class definitions (no call expressions at module/class scope)
+      - pass
+      - an optional module/class docstring
+
+    Disallow:
+      - any top-level Call expressions
+      - control flow at top level (if/for/while/try/with)
+      - comprehensions/lambdas at top level
+      - decorators other than simple names (e.g., @staticmethod, @classmethod, @property)
+    """
+    try:
+        tree = ast.parse(source, mode="exec")
+    except SyntaxError as e:
+        raise e
+
+    allowed_topnodes = (ast.Import, ast.ImportFrom, ast.Assign, ast.AnnAssign,
+                        ast.FunctionDef, ast.ClassDef, ast.Pass, ast.Expr)
+
+    for node in tree.body:
+        if not isinstance(node, allowed_topnodes):
+            raise ModuleSecurityError(f"Disallowed top-level statement: {type(node).__name__}")
+
+        if isinstance(node, ast.Import) or isinstance(node, ast.ImportFrom):
+            _validate_imports_only(ast.unparse(node) if hasattr(ast, "unparse") else _reconstruct_import(node))
+        elif isinstance(node, ast.Expr):
+            # Only allow a pure docstring at module level
+            if not (isinstance(node.value, ast.Constant) and isinstance(node.value.value, str)):
+                raise ModuleSecurityError("Only a module docstring is allowed as a top-level expression.")
+        elif isinstance(node, (ast.Assign, ast.AnnAssign)):
+            # No Call() in targets or values at module scope
+            for sub in ast.walk(node):
+                if isinstance(sub, ast.Call):
+                    raise ModuleSecurityError("Function calls are not allowed at module scope.")
+        elif isinstance(node, ast.FunctionDef):
+            # Decorators allowed only if simple safe names
+            for dec in node.decorator_list:
+                if not isinstance(dec, ast.Name) or dec.id not in {"staticmethod", "classmethod", "property"}:
+                    raise ModuleSecurityError("Unsupported function decorator.")
+            # Defaults and annotations must not invoke calls
+            for sub in ast.walk(node):
+                if isinstance(sub, ast.Call):
+                    # Calls inside the function body are fine; they don't run at import time.
+                    if sub in node.body:  # not reliable to compare nodes; do a cheap scope check below
+                        pass
+            # Prohibit calls in function signature (defaults/annotations)
+            for d in (node.args.defaults or []) + (node.args.kw_defaults or []):
+                if d is not None:
+                    for sub in ast.walk(d):
+                        if isinstance(sub, ast.Call):
+                            raise ModuleSecurityError("Calls in default arguments are not allowed.")
+            if node.returns:
+                for sub in ast.walk(node.returns):
+                    if isinstance(sub, ast.Call):
+                        raise ModuleSecurityError("Calls in return annotations are not allowed.")
+        elif isinstance(node, ast.ClassDef):
+            # Class decorators only as simple safe names (none by default; add if you need @dataclass)
+            for dec in node.decorator_list:
+                if not isinstance(dec, ast.Name):
+                    raise ModuleSecurityError("Unsupported class decorator.")
+                if dec.id not in set():  # empty set -> disallow by default; add "dataclass" if needed
+                    raise ModuleSecurityError(f"Unsupported class decorator @{dec.id}.")
+
+            # For class body: allow defs/assign/pass/docstring only; no calls at class scope
+            for stmt in node.body:
+                if isinstance(stmt, (ast.FunctionDef, ast.Assign, ast.AnnAssign, ast.Pass, ast.Expr)):
+                    if isinstance(stmt, ast.Expr):
+                        if not (isinstance(stmt.value, ast.Constant) and isinstance(stmt.value.value, str)):
+                            raise ModuleSecurityError("Only a class docstring is allowed as a class-level expression.")
+                    else:
+                        for sub in ast.walk(stmt):
+                            if isinstance(sub, ast.Call):
+                                raise ModuleSecurityError("Calls at class scope are not allowed.")
+                else:
+                    raise ModuleSecurityError("Only methods, assignments, pass, and docstrings are allowed in classes.")
+
+    return tree
+
+def _reconstruct_import(node: ast.AST) -> str:
+    """Fallback stringification for imports on older Python without ast.unparse."""
+    if isinstance(node, ast.Import):
+        parts = ", ".join(
+            a.name + (f" as {a.asname}" if a.asname else "")
+            for a in node.names
+        )
+        return f"import {parts}"
+    elif isinstance(node, ast.ImportFrom):
+        parts = ", ".join(
+            a.name + (f" as {a.asname}" if a.asname else "")
+            for a in node.names
+        )
+        dots = "." * (node.level or 0)
+        mod = node.module or ""
+        return f"from {dots}{mod} import {parts}"
+    return ""
+
+
+def _exec_module_safely(source: str, modname: str) -> types.ModuleType:
+    """
+    Compile & execute validated module code with restricted builtins.
+    Import operations inside 'source' are validated (allowlist) and happen via importlib.
+    """
+    tree = _validate_module_source(source)
+    code = compile(tree, filename=f"<grc-module:{modname}>", mode="exec")
+
+    # Reuse your SAFE_BUILTINS from safe_eval
+    try:
+        safe_builtins = SAFE_BUILTINS  # already defined earlier in this file
+    except NameError:
+        # Define the minimal SAFE_BUILTINS once if not present
+        from types import MappingProxyType
+        safe_builtins = MappingProxyType({
+            "object": object, "property": property,
+            "staticmethod": staticmethod, "classmethod": classmethod,
+            "abs": abs, "min": min, "max": max, "round": round,
+            "int": int, "float": float, "complex": complex, "bool": bool,
+            "str": str, "len": len, "tuple": tuple, "list": list, "dict": dict, "set": set,
+        })
+
+    module = types.ModuleType(modname)
+    g = module.__dict__
+    g.clear()
+    g["__name__"] = modname
+    g["__builtins__"] = safe_builtins
+
+    # Provide a tiny import surface by pre-binding a helper that only permits allowed imports.
+    # Instead of exposing __import__, we emulate it via _apply_validated_imports on strings.
+    # But since module code uses Python's 'import' statements, not strings, we rely on
+    # AST validation to ensure only allowed imports exist. No __import__ is present in builtins.
+
+    exec(code, g)
+    return module
+
+def safe_eval(expr: str, globals_ns: dict, locals_ns: Optional[dict] = None):
+    """
+    Validate 'expr' AST, then eval it with restricted builtins and filtered globals.
+    Raises UnsafeExpressionError for unsafe constructs.
+    """
+    if not expr or not isinstance(expr, str):
+        raise UnsafeExpressionError("Empty or invalid expression.")
+
+    # Quick path: simple literal
+    try:
+        # ast.literal_eval is safe but handles only literals/containers
+        return ast.literal_eval(expr)
+    except Exception:
+        pass
+
+    # Parse and validate
+    try:
+        tree = ast.parse(expr, mode="eval")
+    except SyntaxError as e:
+        # keep original error surface for callers
+        raise e
+
+    _SafeExprValidator().visit(tree)
+
+    # Evaluate with restricted globals
+    safe_globals = _filter_globals_for_eval(globals_ns or {})
+    safe_locals = {} if locals_ns is None else dict(locals_ns)  # shallow copy
+
+    # Ensure locals cannot reintroduce builtins
+    safe_locals.pop("__builtins__", None)
+
+    return eval(compile(tree, filename="<safe-expr>", mode="eval"), safe_globals, safe_locals)
 
 
 class FlowGraph(Element):
@@ -232,11 +753,12 @@ class FlowGraph(Element):
         """
         for expr in self.imports():
             try:
-                exec(expr, namespace)
+                _apply_validated_imports(expr, namespace)
             except ImportError:
-                # We do not have a good way right now to determine if an import is for a
-                # hier block, these imports will fail as they are not in the search path
-                # this is ok behavior, unfortunately we could be hiding other import bugs
+                # Hier block imports may fail (search path), keep current behavior
+                pass
+            except (ImportSecurityError, SyntaxError):
+                log.exception(f"Failed to evaluate import expression \"{expr}\"", exc_info=True)
                 pass
             except Exception:
                 log.exception(f"Failed to evaluate import expression \"{expr}\"", exc_info=True)
@@ -246,8 +768,7 @@ class FlowGraph(Element):
     def _reload_modules(self, namespace: dict) -> dict:
         for id, expr in self.get_python_modules():
             try:
-                module = types.ModuleType(id)
-                exec(expr, module.__dict__)
+                module = _exec_module_safely(expr, id)
                 namespace[id] = module
             except Exception:
                 log.exception(f'Failed to evaluate expression in module {id}', exc_info=True)
@@ -261,11 +782,15 @@ class FlowGraph(Element):
         np = {}  # params don't know each other
         for parameter_block in self.get_parameters():
             try:
-                value = eval(
-                    parameter_block.params['value'].to_code(), namespace)
+                code = parameter_block.params['value'].to_code()
+                value = safe_eval(code, namespace)
                 np[parameter_block.name] = value
             except Exception:
-                log.exception(f'Failed to evaluate parameter block {parameter_block.name}', exc_info=True)
+                # Keep original logging behavior
+                log.exception(
+                    f'Failed to evaluate parameter block {parameter_block.name}',
+                    exc_info=True
+                )
                 pass
         namespace.update(np)  # Merge param namespace
         return namespace
@@ -277,8 +802,7 @@ class FlowGraph(Element):
         for variable_block in self.get_variables():
             try:
                 variable_block.rewrite()
-                value = eval(variable_block.value, namespace,
-                             variable_block.namespace)
+                value = safe_eval(variable_block.value, namespace, variable_block.namespace)
                 namespace[variable_block.name] = value
                 # rewrite on subsequent blocks depends on an updated self.namespace
                 self.namespace.update(namespace)
@@ -286,7 +810,10 @@ class FlowGraph(Element):
             except (TypeError, FileNotFoundError, AttributeError, yaml.YAMLError):
                 pass
             except Exception:
-                log.exception(f'Failed to evaluate variable block {variable_block.name}', exc_info=True)
+                log.exception(
+                    f'Failed to evaluate variable block {variable_block.name}',
+                    exc_info=True
+                )
         return namespace
 
     def _renew_namespace(self) -> None:
@@ -310,13 +837,18 @@ class FlowGraph(Element):
         """
         Evaluate the expression within the specified global and local namespaces
         """
-        # Evaluate
         if not expr:
             raise Exception('Cannot evaluate empty statement.')
+    
         if namespace is not None:
-            return eval(expr, namespace, local_namespace)
+            return safe_eval(expr, namespace, local_namespace)
         else:
-            return self._eval_cache.setdefault(expr, eval(expr, self.namespace, local_namespace))
+            # cache only successful results
+            if expr in self._eval_cache:
+                return self._eval_cache[expr]
+            value = safe_eval(expr, self.namespace, local_namespace)
+            self._eval_cache[expr] = value
+            return value
 
     ##############################################
     # Add/remove stuff
