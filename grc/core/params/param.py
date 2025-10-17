@@ -5,6 +5,8 @@
 #
 
 
+import importlib
+import sys
 import ast
 import collections
 import textwrap
@@ -184,6 +186,94 @@ class Param(Element):
         except ValueError:
             return False
 
+    def _module_is_allowed(modname: str, allowed_modules: set | None) -> bool:
+        """
+        Return True if modname is allowed. If allowed_modules is None or empty,
+        allow all modules. Otherwise, allow exact matches or submodules of any
+        allowed module (e.g., 'numpy.linalg' if 'numpy' is allowed).
+        """
+        if not allowed_modules:
+            return True
+        return any(
+            modname == allowed or modname.startswith(allowed + ".")
+            for allowed in allowed_modules
+        )
+    
+    
+    def _safe_import_names(expr: str, allowed_modules: set | None = None) -> list[str]:
+        """
+        Safely process a string of *only* import statements and return the names
+        that would be introduced into the local namespace, without using exec().
+    
+        Supported:
+          - import pkg
+          - import pkg as alias
+          - import pkg.subpkg
+          - from pkg.subpkg import name
+          - from pkg.subpkg import name as alias
+    
+        Rejected:
+          - non-import statements
+          - relative imports (e.g., 'from . import x', 'from ..pkg import y')
+          - wildcard imports ('from x import *')
+    
+        Behavior notes:
+          - 'import a.b' binds name 'a' (like Python).
+          - For 'import a.b as c', binds 'c'.
+          - For 'from a.b import c', binds 'c' (or alias).
+        """
+        try:
+            tree = ast.parse(expr, mode="exec")
+        except SyntaxError as e:
+            raise SyntaxError(f"Bad import syntax: {e}") from e
+    
+        # Enforce only import statements
+        if not all(isinstance(node, (ast.Import, ast.ImportFrom)) for node in tree.body):
+            raise Exception("Only import statements are allowed in this field.")
+    
+        introduced: dict[str, object] = {}
+    
+        for node in tree.body:
+            if isinstance(node, ast.Import):
+                # e.g., import a, import a.b, import a.b as c
+                for alias in node.names:
+                    modname = alias.name  # may contain dots
+                    asname = alias.asname
+                    if not _module_is_allowed(modname, allowed_modules):
+                        raise ImportError(f'Module "{modname}" is not allowed.')
+    
+                    # Load the submodule to ensure availability in sys.modules
+                    importlib.import_module(modname)
+    
+                    if asname:
+                        # Bind alias to the requested module object
+                        introduced[asname] = importlib.import_module(modname)
+                    else:
+                        # Python semantics: 'import a.b' binds 'a', not 'a.b'
+                        top_level = modname.split(".")[0]
+                        # Ensure top-level is imported & available
+                        importlib.import_module(top_level)
+                        introduced[top_level] = sys.modules[top_level]
+    
+            elif isinstance(node, ast.ImportFrom):
+                # e.g., from a.b import c, from a.b import c as d
+                if node.level and node.level > 0:
+                    raise ImportError("Relative imports are not allowed.")
+                if any(alias.name == "*" for alias in node.names):
+                    raise ImportError('Wildcard imports ("from ... import *") are not allowed.')
+    
+                module_name = node.module or ""
+                if not _module_is_allowed(module_name, allowed_modules):
+                    raise ImportError(f'Module "{module_name}" is not allowed.')
+    
+                module = importlib.import_module(module_name)
+                for alias in node.names:
+                    imported_obj = getattr(module, alias.name)
+                    bind_name = alias.asname or alias.name
+                    introduced[bind_name] = imported_obj
+        # Return just the variable names introduced
+        return sorted(introduced.keys())
+
     def evaluate(self) -> EvaluationType:
         """
         Evaluate the value.
@@ -274,19 +364,25 @@ class Param(Element):
         # Import Type
         #########################
         elif dtype == 'import':
-            # New namespace
-            n = dict()
-            try:
-                exec(expr, n)
-            except ImportError:
-                raise Exception('Import "{}" failed.'.format(expr))
-            except Exception:
-                raise Exception('Bad import syntax: "{}".'.format(expr))
-            return [k for k in list(n.keys()) if str(k) != '__builtins__']
+            # Optional: support a per-parameter module allowlist if present on options
+            allowed = None
+            if hasattr(self, "options") and hasattr(self.options, "allowed_modules"):
+                # Expecting an iterable of strings (module names/prefixes)
+                try:
+                    allowed = set(self.options.allowed_modules or [])
+                except Exception:
+                    allowed = None
 
-        #########################
-        else:
-            raise TypeError('Type "{}" not handled'.format(dtype))
+            try:
+                names = _safe_import_names(expr, allowed_modules=allowed)
+            except ImportError as e:
+                raise Exception(f'Import "{expr}" failed:\n{e}')
+            except SyntaxError:
+                raise Exception(f'Bad import syntax: "{expr}".')
+            except Exception as e:
+                raise Exception(f'Invalid import expression "{expr}":\n{e}')
+
+            return names
 
     def to_code(self):
         """
