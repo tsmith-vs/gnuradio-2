@@ -185,7 +185,7 @@ class Param(Element):
             return True
         except ValueError:
             return False
-
+    @staticmethod
     def _module_is_allowed(modname: str, allowed_modules: set | None) -> bool:
         """
         Return True if modname is allowed. If allowed_modules is None or empty,
@@ -199,7 +199,7 @@ class Param(Element):
             for allowed in allowed_modules
         )
     
-    
+    @staticmethod
     def _safe_import_names(expr: str, allowed_modules: set | None = None) -> list[str]:
         """
         Safely process a string of *only* import statements and return the names
@@ -239,7 +239,7 @@ class Param(Element):
                 for alias in node.names:
                     modname = alias.name  # may contain dots
                     asname = alias.asname
-                    if not _module_is_allowed(modname, allowed_modules):
+                    if not Param._module_is_allowed(modname, allowed_modules):
                         raise ImportError(f'Module "{modname}" is not allowed.')
     
                     # Load the submodule to ensure availability in sys.modules
@@ -263,7 +263,7 @@ class Param(Element):
                     raise ImportError('Wildcard imports ("from ... import *") are not allowed.')
     
                 module_name = node.module or ""
-                if not _module_is_allowed(module_name, allowed_modules):
+                if not Param._module_is_allowed(module_name, allowed_modules):
                     raise ImportError(f'Module "{module_name}" is not allowed.')
     
                 module = importlib.import_module(module_name)
@@ -374,7 +374,7 @@ class Param(Element):
                     allowed = None
 
             try:
-                names = _safe_import_names(expr, allowed_modules=allowed)
+                names = Params._safe_import_names(expr, allowed_modules=allowed)
             except ImportError as e:
                 raise Exception(f'Import "{expr}" failed:\n{e}')
             except SyntaxError:
