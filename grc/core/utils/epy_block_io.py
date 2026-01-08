@@ -1,5 +1,8 @@
 
-
+import ast
+import builtins as py_builtins
+import importlib
+import types
 import inspect
 import collections
 
@@ -15,6 +18,176 @@ TYPE_MAP = {
 BlockIO = collections.namedtuple(
     'BlockIO', 'name cls params sinks sources doc callbacks')
 
+class SecurityError(Exception):
+    """Raised when user-supplied source violates safety rules."""
+
+
+# Minimal builtins typically needed for class definitions & simple code.
+# Strictly avoid __import__, exec, eval, open, compile, etc.
+SAFE_BUILTINS = {
+    "object": py_builtins.object,
+    "property": py_builtins.property,
+    "staticmethod": py_builtins.staticmethod,
+    "classmethod": py_builtins.classmethod,
+    "len": py_builtins.len,
+    "range": py_builtins.range,
+    "enumerate": py_builtins.enumerate,
+    "zip": py_builtins.zip,
+    "min": py_builtins.min,
+    "max": py_builtins.max,
+    "sum": py_builtins.sum,
+    "abs": py_builtins.abs,
+    "int": py_builtins.int,
+    "float": py_builtins.float,
+    "complex": py_builtins.complex,
+    "bool": py_builtins.bool,
+    "str": py_builtins.str,
+    "bytes": py_builtins.bytes,
+    "list": py_builtins.list,
+    "tuple": py_builtins.tuple,
+    "dict": py_builtins.dict,
+    "set": py_builtins.set,
+}
+
+# Allowlisted modules that are common/expected in EPY blocks.
+# This can be exetended via configuration if needed.
+ALLOWED_IMPORT_PREFIXES = {
+    "numpy",
+    "gnuradio",
+    "gnuradio.gr",
+    "pmt",
+}
+
+
+def _is_allowed_import(modname: str) -> bool:
+    if not modname:
+        return False
+    return any(
+        modname == prefix or modname.startswith(prefix + ".")
+        for prefix in ALLOWED_IMPORT_PREFIXES
+    )
+
+
+def _validate_epy_module_ast(source: str) -> ast.Module:
+    """
+    Parse and validate that the source contains only:
+      - import / from-import (no relative, no wildcard, allowlist enforced)
+      - class definitions (limited decorators)
+      - optional module docstring
+
+    We reject:
+      - any other top-level statements (calls, with, try, for, etc.)
+      - relative or wildcard imports
+      - disallowed imports
+      - suspicious decorators at class level
+    """
+    try:
+        tree = ast.parse(source, mode="exec")
+    except SyntaxError as e:
+        raise SyntaxError(f"Syntax error in EPY block: {e}") from e
+
+    allowed_topnodes = (ast.Import, ast.ImportFrom, ast.ClassDef, ast.Expr)
+    if not all(isinstance(node, allowed_topnodes) for node in tree.body):
+        raise SecurityError("Only imports, class definitions, and docstrings are allowed at module level.")
+
+    # Validate imports
+    for node in tree.body:
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                modname = alias.name
+                if not _is_allowed_import(modname):
+                    raise SecurityError(f'Disallowed import: "{modname}"')
+        elif isinstance(node, ast.ImportFrom):
+            if (node.level or 0) > 0:
+                raise SecurityError("Relative imports are not allowed.")
+            if any(a.name == "*" for a in node.names):
+                raise SecurityError('Wildcard imports (from x import *) are not allowed.')
+            if not node.module or not _is_allowed_import(node.module):
+                raise SecurityError(f'Disallowed import: "{node.module or ""}"')
+        elif isinstance(node, ast.Expr):
+            # Only allow a docstring expr at module level
+            if not isinstance(node.value, ast.Constant) or not isinstance(node.value.value, str):
+                raise SecurityError("Only a module docstring is allowed as a top-level expression.")
+        elif isinstance(node, ast.ClassDef):
+            # Validate class decorators (only common safe ones)
+            for dec in node.decorator_list:
+                if not isinstance(dec, ast.Name):
+                    raise SecurityError("Unsupported class decorator.")
+                if dec.id not in {"dataclass"}:  # Extend if you want to allow @dataclass
+                    # We allow no decorators by default; comment out the next line if @dataclass is not desired.
+                    raise SecurityError(f"Unsupported class decorator @{dec.id}.")
+
+            # Limit class-level statements: functions, assignments, docstrings, pass
+            for stmt in node.body:
+                if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.AnnAssign, ast.Assign, ast.Pass)):
+                    # Disallow Calls in default values at class scope to reduce side effects
+                    for sub in ast.walk(stmt):
+                        if isinstance(sub, ast.Call):
+                            raise SecurityError("Function calls at class scope are not allowed.")
+                elif isinstance(stmt, ast.Expr):
+                    # docstring allowed
+                    if not (isinstance(stmt.value, ast.Constant) and isinstance(stmt.value.value, str)):
+                        raise SecurityError("Only a docstring is allowed as a class-level expression.")
+                else:
+                    raise SecurityError("Only methods, assignments, pass, and docstrings are allowed inside classes.")
+
+    return tree
+
+
+def _load_epy_module_safely(source: str) -> types.ModuleType:
+    """
+    Compile & execute validated AST in an isolated module dict with restricted builtins.
+    Pre-imports a small set of allowed modules and injects them into the globals.
+    """
+    tree = _validate_epy_module_ast(source)
+    code = compile(tree, filename="<grc-epy>", mode="exec")
+
+    # Build isolated globals with restricted builtins
+    g: dict = {"__name__": "<grc-epy>", "__builtins__": SAFE_BUILTINS}
+
+    # Pre-import the allowlisted modules that EPY blocks typically rely on
+    # and provide common aliases (e.g., numpy as np)
+    try:
+        gr = importlib.import_module("gnuradio.gr")
+        g["gr"] = gr
+    except Exception:
+        # The caller (extract) separately handles missing GNU Radio
+        pass
+
+    try:
+        np = importlib.import_module("numpy")
+        g["numpy"] = np
+        g["np"] = np
+    except Exception:
+        pass
+
+    try:
+        pmt = importlib.import_module("pmt")
+        g["pmt"] = pmt
+    except Exception:
+        pass
+
+    # Execute the validated code object in the isolated namespace
+    # NOTE: executing code is unavoidable to materialize classes.
+    exec(code, g)  # safer because code is AST-validated & builtins are restricted
+
+    # Wrap as a module-like object for consistency with inspect workflows
+    mod = types.ModuleType("<grc-epy>")
+    mod.__dict__.update(g)
+    return mod
+
+
+def _find_block_class_safely(source_code: str, cls) -> type:
+    """
+    Load user code in a restricted environment and return the first class
+    that is a subclass of `cls`. Raises ValueError if not found or unsafe.
+    """
+    mod = _load_epy_module_safely(source_code)
+
+    for var in mod.__dict__.values():
+        if inspect.isclass(var) and issubclass(var, cls):
+            return var
+    raise ValueError("No python block class found in code")
 
 def _ports(sigs, msgs):
     ports = list()
@@ -32,15 +205,13 @@ def _ports(sigs, msgs):
 
 
 def _find_block_class(source_code, cls):
-    ns = {}
     try:
-        exec(source_code, ns)
+        return _find_block_class_safely(source_code, cls)
+    except (SyntaxError, SecurityError) as e:
+        raise ValueError("Can't interpret source code: " + str(e)) from e
     except Exception as e:
-        raise ValueError("Can't interpret source code: " + str(e))
-    for var in ns.values():
-        if inspect.isclass(var) and issubclass(var, cls):
-            return var
-    raise ValueError('No python block class found in code')
+        # Preserve previous error contract
+        raise ValueError("Can't interpret source code: " + str(e)) from e
 
 
 def extract(cls):
