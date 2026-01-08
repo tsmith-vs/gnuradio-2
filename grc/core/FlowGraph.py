@@ -107,7 +107,7 @@ _ALLOWED_NODE_TYPES = (
 )
 
 # Allowed operators
-_ALLOWED_BINOPS = (ast.Add, ast.Sub, ast.Mult, ast.Div, ast.FloorDiv, ast.Mod, ast.Pow, ast.MatMul)
+_ALLOWED_BINOPS = (ast.Add, ast.Sub, ast.Mult, ast.Div, ast.FloorDiv, ast.Mod, ast.Pow, ast.MatMult)
 _ALLOWED_UNARYOPS = (ast.UAdd, ast.USub, ast.Not, ast.Invert)
 _ALLOWED_CMPOPS = (ast.Eq, ast.NotEq, ast.Lt, ast.LtE, ast.Gt, ast.GtE, ast.Is, ast.IsNot, ast.In, ast.NotIn)
 _ALLOWED_BOOLOPS = (ast.And, ast.Or)
